@@ -1,0 +1,780 @@
+# Detecting anomalies in network traffic using Isolation Forest, Random Forest, and XGBoost machine learning methods.
+
+# feature_engineering.py
+# 2 pipelines for ablation:
+#   A = baseline (flow-stats + keep port/protocol/flags)  [NO IP-aggregate behavior]
+#   B = behavior-enriched (includes protocol/port semantics + throughput/duration logs + IP-based aggregates)
+#
+# Split: GROUP SPLIT by IPV4_SRC_ADDR (no src_ip overlap between train/test)
+# Notes:
+# - We do NOT feed raw IP strings to the model. We only use IP to compute behavior stats.
+# - Behavior stats computed WITHIN EACH SPLIT (train/test separately), past-only (time sorted).
+# - Additionally: remove exact-duplicate feature rows across splits (DEDUP_COLS hash) to prevent RF ~100%.
+# - Extra drop: strong proxy-like features (apply to BOTH A and B for fair ablation) with 2 modes:
+#     * PROXY_DROP_MODE="light" (recommended first)
+#     * PROXY_DROP_MODE="hard"  (stress)
+
+from __future__ import annotations
+
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+import joblib
+
+# =============================================================================
+# USER CONFIG
+# =============================================================================
+DATASET_REL = Path(r"D:\Information Security\Final\main_dataset\data\NF-UNSW-NB15-v3.csv")   # đổi sang v2: data/NF-UNSW-NB15-v2.csv
+DATASET_TAG = "v3"                                   # đổi sang v2: "v2"
+# =======================
+# REVIEW2 RUN TAG (baseline vs anti_proxy)
+# =======================
+RUN_TAG = "baseline"          # "baseline" hoặc "final"
+
+# Anti-proxy (Hân): drop identifier-like features để test generalization
+DROP_SUSPECT_FEATURES = (RUN_TAG == "anti_proxy")
+
+SUSPECT_COLS_CANDIDATES = [
+    "IPV4_SRC_ADDR", "IPV4_DST_ADDR",
+    "L4_SRC_PORT", "L4_DST_PORT",
+    "FLOW_ID", "FLOWID", "FLOW_ID_HASH",
+    "SRC_MAC", "DST_MAC", "MAC", "SRC_MAC_ADDR", "DST_MAC_ADDR",
+]
+# (OPTION) So sánh công bằng v2-v3: ép v3 chỉ dùng feature subset theo schema v2
+# - Nếu bạn để True: script sẽ chỉ lấy numeric columns thuộc danh sách trong file schema
+USE_COMMON_FEATURE_SCHEMA = False
+COMMON_FEATURE_SCHEMA_CSV = r"D:\Information Security\Final\main_dataset\data\NetFlow_v3_Features.csv"  # file bạn gửi (đặt vào data/)
+COMMON_FEATURE_SCHEMA_COL = "Feature"
+# =============================================================================
+
+# =======================
+# Config
+# =======================
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+
+# Group split
+GROUP_COL_CANDIDATES = ["IPV4_SRC_ADDR", "SRC_IP", "src_ip", "source_ip"]
+
+# Time columns (for optional time_bin features)
+TIME_COL_CANDIDATES = ["FLOW_START_MILLISECONDS", "FLOW_END_MILLISECONDS"]
+TIME_BIN_MINUTES = 5
+USE_TIMEBIN_BEHAVIOR = True
+DROP_TIME_BIN_AS_FEATURE = True
+
+# Keep raw net-id/service features? (Teacher Hải: DO NOT drop these)
+KEEP_RAW_PORTS_PROTOCOL = True
+if RUN_TAG == "anti_proxy":
+    # anti_proxy: ưu tiên bỏ ports/protocol để kiểm tra model có học hành vi không
+    KEEP_RAW_PORTS_PROTOCOL = False
+# Drop suspicious proxy-like features (based on your audits)
+DROP_TTL_ALWAYS = True
+DROP_PROXY_ALWAYS = True
+TTL_COLS_CAND = ["MIN_TTL", "MAX_TTL"]
+PROXY_COLS_CAND = ["MIN_IP_PKT_LEN", "MAX_IP_PKT_LEN", "SHORTEST_FLOW_PKT", "LONGEST_FLOW_PKT"]
+
+# Drop raw time columns from model features to avoid trivial time cues
+DROP_RAW_TIME_FROM_MODEL = True
+
+# Logging sample
+DEBUG_SAMPLE_ROWS = 200_000
+
+# Save float32
+SAVE_AS_FLOAT32 = True
+
+# Split search tries to keep pos% roughly similar
+GROUP_SPLIT_TRIES = 20
+
+# =======================
+# Extra drop: strong proxy-like features (apply to BOTH A and B)
+# =======================
+DROP_STUMP_PROXY_ALWAYS = True
+PROXY_DROP_MODE = "light"   # "light" (recommended) or "hard" (stress)
+
+STUMP_PROXY_COLS_LIGHT = [
+    "SERVER_TCP_FLAGS",
+    "TCP_FLAGS",
+    "CLIENT_TCP_FLAGS",
+    "DST_TO_SRC_AVG_THROUGHPUT",
+]
+
+STUMP_PROXY_COLS_HARD = [
+    "SERVER_TCP_FLAGS",
+    "DST_TO_SRC_AVG_THROUGHPUT",
+    "TCP_FLAGS",
+    "CLIENT_TCP_FLAGS",
+    "SRC_TO_DST_SECOND_BYTES",
+    "TCP_WIN_MAX_OUT",
+    "OUT_BYTES",
+    "OUT_PKTS",
+    "RETRANSMITTED_OUT_PKTS",
+    "RETRANSMITTED_OUT_BYTES",
+    "SRC_TO_DST_IAT_AVG",
+    "SRC_TO_DST_IAT_STDDEV",
+    "DST_TO_SRC_IAT_STDDEV",
+    "DST_TO_SRC_IAT_AVG",
+    "DST_TO_SRC_IAT_MAX",
+    "NUM_PKTS_UP_TO_128_BYTES",
+    # "L7_PROTO",
+    "IN_PKTS",
+    "IN_BYTES",
+    "RETRANSMITTED_IN_PKTS",
+]
+
+# =======================
+# B: keep IP-based behavior aggregates (Teacher Hải suggestion)
+# If you want "safe" mode (drop aggregates), set these True.
+# =======================
+DROP_SRC_BEHAVIOR_IN_B = False
+SRC_PROXY_BEHAVIOR_COLS = {
+    "src_flow_count",
+    "src_unique_dst_ip",
+    "src_unique_dst_port",
+    "src_bytes_sum",
+    "src_pkts_sum",
+    "src_duration_mean",
+    "src_flow_count_5m",
+    "src_unique_dst_ip_5m",
+    "src_unique_dst_port_5m",
+}
+
+DROP_DST_BEHAVIOR_IN_B = False
+DST_PROXY_BEHAVIOR_COLS = {
+    "dst_flow_count",
+    "dst_unique_src_ip",
+    "dst_unique_src_port",
+}
+
+# =======================
+# Dedup exact duplicates across splits
+# =======================
+DEDUP_ACROSS_SPLITS = True
+DEDUP_USE_BASE_NUMERIC = True
+
+# =======================
+# Project root finder
+# =======================
+def find_project_root(script_dir: Path, dataset_rel: Path) -> Path:
+    for p in [script_dir] + list(script_dir.parents):
+        if (p / dataset_rel).exists():
+            return p
+    raise FileNotFoundError(f"Cannot find project root containing {dataset_rel}")
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = find_project_root(SCRIPT_DIR, DATASET_REL)
+DATA_PATH = ROOT / DATASET_REL
+
+DATA_DIR = ROOT / "data"
+ARTEFACT_DIR = ROOT / "artefacts" / DATASET_TAG / RUN_TAG
+ARTEFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("SCRIPT_DIR   =", SCRIPT_DIR)
+print("ROOT         =", ROOT)
+print("DATA_PATH    =", DATA_PATH, "| exists:", DATA_PATH.exists())
+print("ARTEFACT_DIR =", ARTEFACT_DIR)
+print("RUN_TAG      =", RUN_TAG)
+print("DROP_SUSPECT_FEATURES =", DROP_SUSPECT_FEATURES)
+
+if not DATA_PATH.exists():
+    raise FileNotFoundError(f"Không thấy dataset: {DATA_PATH}")
+
+# =======================
+# Load
+# =======================
+df = pd.read_csv(DATA_PATH, low_memory=False)
+df.columns = df.columns.astype(str).str.strip()
+
+LABEL_COL = "Label"     # 0/1
+ATTACK_COL = "Attack"   # multiclass string
+
+if LABEL_COL not in df.columns:
+    raise ValueError(f"Không thấy cột nhãn '{LABEL_COL}'.")
+if ATTACK_COL not in df.columns:
+    raise ValueError(f"Không thấy cột '{ATTACK_COL}'.")
+
+df[ATTACK_COL] = df[ATTACK_COL].astype(str).str.strip().replace("�", "-", regex=True)
+
+y_bin = df[LABEL_COL].astype(int)
+y_attack = df[ATTACK_COL].astype(str)
+
+attack_classes = sorted(y_attack.unique().tolist())
+print("\nAttack classes ({}): {}".format(len(attack_classes), attack_classes))
+
+print("\nLabel distribution (binary):")
+print(y_bin.value_counts())
+print("Percent:")
+print((y_bin.value_counts(normalize=True) * 100).round(3))
+
+print("\nAttack distribution (multiclass) top 10:")
+print(y_attack.value_counts().head(10))
+
+# =======================
+# Helpers
+# =======================
+def clean_numeric_frame(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+    X = X.replace([np.inf, -np.inf], np.nan)
+    return X
+
+def pick_first_existing(cols: list[str], df_full: pd.DataFrame) -> str | None:
+    for c in cols:
+        if c in df_full.columns:
+            return c
+    return None
+
+def pick_time_col(df_full: pd.DataFrame) -> str | None:
+    for c in TIME_COL_CANDIDATES:
+        if c in df_full.columns and pd.api.types.is_numeric_dtype(df_full[c]):
+            return c
+    return None
+
+def build_preprocessor(feature_cols: list[str]) -> ColumnTransformer:
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+    return ColumnTransformer(
+        transformers=[("num", numeric_transformer, feature_cols)],
+        remainder="drop",
+    )
+
+def choose_group_split(
+    groups: np.ndarray,
+    y: np.ndarray,
+    group_name: str,
+    test_size: float,
+    base_seed: int,
+    tries: int
+) -> tuple[np.ndarray, np.ndarray, str]:
+    y = np.asarray(y).ravel()
+    pos_all = float(np.mean(y == 1))
+
+    best = None
+    best_score = 1e9
+    best_tag = ""
+
+    for i in range(tries):
+        seed = base_seed + i
+        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        tr_idx, te_idx = next(gss.split(np.zeros(len(y)), y, groups))
+
+        pos_tr = float(np.mean(y[tr_idx] == 1))
+        pos_te = float(np.mean(y[te_idx] == 1))
+
+        score = abs(pos_tr - pos_all) + abs(pos_te - pos_all)
+        if score < best_score:
+            best_score = score
+            best = (tr_idx.astype(np.int64), te_idx.astype(np.int64))
+            best_tag = f"group({group_name}) seed={seed} pos_all={pos_all:.4f} pos_tr={pos_tr:.4f} pos_te={pos_te:.4f}"
+
+    assert best is not None
+    return best[0], best[1], best_tag
+
+def remove_cross_split_duplicates_by_hash(
+    df_full: pd.DataFrame,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    cols: list[str],
+) -> np.ndarray:
+    if len(cols) == 0:
+        return test_idx
+
+    tr = df_full.iloc[train_idx][cols]
+    te = df_full.iloc[test_idx][cols]
+
+    tr_hash = pd.util.hash_pandas_object(tr, index=False).to_numpy(dtype=np.uint64)
+    te_hash = pd.util.hash_pandas_object(te, index=False).to_numpy(dtype=np.uint64)
+
+    tr_unique = np.unique(tr_hash)
+    is_dup = np.isin(te_hash, tr_unique, assume_unique=False)
+
+    n_dup = int(is_dup.sum())
+    if n_dup > 0:
+        print(f"[DEDUP] Removing {n_dup} / {len(test_idx)} test rows duplicated in train (by cols hash).")
+        test_idx = test_idx[~is_dup]
+    else:
+        print("[DEDUP] No exact duplicate rows across splits (by cols hash).")
+
+    return test_idx
+
+def load_common_schema_list() -> set[str]:
+    if not USE_COMMON_FEATURE_SCHEMA:
+        return set()
+    schema_path = ROOT / COMMON_FEATURE_SCHEMA_CSV
+    if not schema_path.exists():
+        print(f"[WARN] COMMON_FEATURE_SCHEMA_CSV not found: {schema_path} -> ignore schema restriction")
+        return set()
+    tmp = pd.read_csv(schema_path, low_memory=False)
+    if COMMON_FEATURE_SCHEMA_COL not in tmp.columns:
+        print(f"[WARN] schema csv missing column '{COMMON_FEATURE_SCHEMA_COL}' -> ignore schema restriction")
+        return set()
+    feats = tmp[COMMON_FEATURE_SCHEMA_COL].astype(str).str.strip().tolist()
+    feats = [x for x in feats if x]
+    print(f"[SCHEMA] Loaded {len(feats)} feature names from {schema_path}")
+    return set(feats)
+
+# =======================
+# Split indices (GROUP by SRC_IP)
+# =======================
+group_col = pick_first_existing(GROUP_COL_CANDIDATES, df)
+
+if group_col is None:
+    print("[WARN] No SRC_IP-like column found -> fallback random stratified split")
+    idx_all = np.arange(len(df))
+    train_idx, test_idx = train_test_split(
+        idx_all,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y_bin.to_numpy() if y_bin.nunique() > 1 else None,
+    )
+    split_tag = "random(stratified,fallback_no_group)"
+else:
+    group_series = df[group_col].astype(str)
+    groups = group_series.to_numpy()
+
+    print("group_col =", group_col)
+    print("n_unique groups =", int(group_series.nunique()))
+    print("sample groups:", group_series.unique()[:10])
+
+    train_idx, test_idx, split_tag = choose_group_split(
+        groups=groups,
+        y=y_bin.to_numpy(),
+        group_name=group_col,
+        test_size=TEST_SIZE,
+        base_seed=RANDOM_STATE,
+        tries=GROUP_SPLIT_TRIES,
+    )
+
+print("\nSplit tag:", split_tag)
+print("Index overlap (#):", int(len(np.intersect1d(train_idx, test_idx))))
+
+if group_col is not None:
+    tr_g = set(df.iloc[train_idx][group_col].astype(str).unique().tolist())
+    te_g = set(df.iloc[test_idx][group_col].astype(str).unique().tolist())
+    overlap = tr_g & te_g
+    print(f"Group col={group_col} | n_train_groups={len(tr_g)} n_test_groups={len(te_g)} overlap_groups={len(overlap)}")
+    assert len(overlap) == 0, "Group leakage: train/test share SRC_IP!"
+
+# =======================
+# Behavior features for B (computed per split, past-only)
+# =======================
+ENGINEERED_BEHAVIOR_COLS = [
+    "is_tcp", "is_udp", "is_icmp", "is_other_l4",
+    "dst_port_privileged", "dst_port_ephemeral", "dst_port_bucket",
+    "svc_http", "svc_https", "svc_dns", "svc_ftp", "svc_ssh", "svc_smtp",
+    "bytes_per_pkt", "log_total_bytes", "log_flow_duration_s", "log_throughput_bps",
+    "src_flow_count", "src_unique_dst_ip", "src_unique_dst_port",
+    "src_bytes_sum", "src_pkts_sum", "src_duration_mean",
+    "dst_flow_count", "dst_unique_src_ip", "dst_unique_src_port",
+    "src_flow_count_5m", "src_unique_dst_ip_5m", "src_unique_dst_port_5m",
+    "time_bin",
+]
+
+def add_behavior_features_online(df_in: pd.DataFrame) -> pd.DataFrame:
+    dfb = df_in.copy()
+
+    src_ip = group_col if (group_col is not None and group_col in dfb.columns) else None
+    dst_ip = "IPV4_DST_ADDR" if "IPV4_DST_ADDR" in dfb.columns else None
+    src_port = "L4_SRC_PORT" if "L4_SRC_PORT" in dfb.columns else None
+    dst_port = "L4_DST_PORT" if "L4_DST_PORT" in dfb.columns else None
+
+    dfb["_orig_order_"] = np.arange(len(dfb), dtype=np.int64)
+
+    time_col = pick_time_col(dfb)
+    if time_col is None:
+        dfb["_tmp_time_order_"] = dfb["_orig_order_"]
+        time_col = "_tmp_time_order_"
+
+    if src_ip is not None:
+        dfb[src_ip] = dfb[src_ip].astype(str)
+    if dst_ip is not None:
+        dfb[dst_ip] = dfb[dst_ip].astype(str)
+
+    dfb = dfb.sort_values(time_col, kind="mergesort").reset_index(drop=True)
+
+    if "PROTOCOL" in dfb.columns and pd.api.types.is_numeric_dtype(dfb["PROTOCOL"]):
+        proto = dfb["PROTOCOL"].fillna(-1).astype("int64")
+        dfb["is_tcp"] = (proto == 6).astype("int8")
+        dfb["is_udp"] = (proto == 17).astype("int8")
+        dfb["is_icmp"] = (proto == 1).astype("int8")
+        dfb["is_other_l4"] = (~proto.isin([1, 6, 17])).astype("int8")
+    else:
+        dfb["is_tcp"] = 0
+        dfb["is_udp"] = 0
+        dfb["is_icmp"] = 0
+        dfb["is_other_l4"] = 0
+
+    if dst_port is not None and dst_port in dfb.columns and pd.api.types.is_numeric_dtype(dfb[dst_port]):
+        p = dfb[dst_port].fillna(-1).astype("int64")
+        dfb["dst_port_privileged"] = ((p >= 0) & (p <= 1023)).astype("int8")
+        dfb["dst_port_ephemeral"] = (p >= 49152).astype("int8")
+        dfb["dst_port_bucket"] = np.select(
+            [p < 0, (p >= 0) & (p <= 1023), (p >= 1024) & (p <= 49151), p >= 49152],
+            [0, 1, 2, 3],
+            default=0
+        ).astype("int8")
+        dfb["svc_http"] = p.isin([80]).astype("int8")
+        dfb["svc_https"] = p.isin([443]).astype("int8")
+        dfb["svc_dns"]  = p.isin([53]).astype("int8")
+        dfb["svc_ftp"]  = p.isin([20, 21]).astype("int8")
+        dfb["svc_ssh"]  = p.isin([22]).astype("int8")
+        dfb["svc_smtp"] = p.isin([25]).astype("int8")
+    else:
+        for c in ["dst_port_privileged", "dst_port_ephemeral", "dst_port_bucket",
+                  "svc_http", "svc_https", "svc_dns", "svc_ftp", "svc_ssh", "svc_smtp"]:
+            dfb[c] = 0
+
+    if src_ip is None:
+        for c in ["bytes_per_pkt", "log_total_bytes", "log_flow_duration_s", "log_throughput_bps"]:
+            dfb[c] = 0.0
+        for c in [
+            "src_flow_count", "src_unique_dst_ip", "src_unique_dst_port",
+            "src_bytes_sum", "src_pkts_sum", "src_duration_mean",
+            "dst_flow_count", "dst_unique_src_ip", "dst_unique_src_port",
+            "src_flow_count_5m", "src_unique_dst_ip_5m", "src_unique_dst_port_5m",
+            "time_bin",
+        ]:
+            dfb[c] = 0
+        dfb = dfb.sort_values("_orig_order_", kind="mergesort").reset_index(drop=True)
+        dfb = dfb.drop(columns=["_orig_order_"], errors="ignore")
+        dfb = dfb.drop(columns=["_tmp_time_order_"], errors="ignore")
+        return dfb
+
+    bytes_cols = [c for c in ["IN_BYTES", "OUT_BYTES"] if c in dfb.columns and pd.api.types.is_numeric_dtype(dfb[c])]
+    pkts_cols  = [c for c in ["IN_PKTS", "OUT_PKTS"] if c in dfb.columns and pd.api.types.is_numeric_dtype(dfb[c])]
+    dur_col = "FLOW_DURATION_MILLISECONDS" if "FLOW_DURATION_MILLISECONDS" in dfb.columns else None
+
+    dfb["total_bytes"] = (dfb[bytes_cols].sum(axis=1) if bytes_cols else 0.0).astype("float32")
+    dfb["total_pkts"]  = (dfb[pkts_cols].sum(axis=1) if pkts_cols else 0.0).astype("float32")
+    dfb["dur"] = (
+        dfb[dur_col].astype("float32")
+        if (dur_col is not None and dur_col in dfb.columns and pd.api.types.is_numeric_dtype(dfb[dur_col]))
+        else 0.0
+    )
+
+    dur_s = (dfb["dur"].astype("float32") / 1000.0).astype("float32")
+    eps = np.float32(1e-6)
+
+    pkts = np.maximum(dfb["total_pkts"].astype("float32"), np.float32(1.0))
+    dfb["bytes_per_pkt"] = (dfb["total_bytes"].astype("float32") / pkts).astype("float32")
+
+    dfb["log_total_bytes"] = np.log1p(dfb["total_bytes"].astype("float32")).astype("float32")
+    dfb["log_flow_duration_s"] = np.log1p(np.maximum(dur_s, eps)).astype("float32")
+
+    throughput_bps = (dfb["total_bytes"].astype("float32") * np.float32(8.0)) / np.maximum(dur_s, eps)
+    dfb["log_throughput_bps"] = np.log1p(np.maximum(throughput_bps, np.float32(0.0))).astype("float32")
+
+    g = dfb.groupby(src_ip, sort=False)
+
+    dfb["src_flow_count"] = g.cumcount().astype("int32")
+    dfb["src_bytes_sum"] = g["total_bytes"].transform(lambda s: s.cumsum().shift(1)).fillna(0).astype("float32")
+    dfb["src_pkts_sum"]  = g["total_pkts"].transform(lambda s: s.cumsum().shift(1)).fillna(0).astype("float32")
+
+    dur_cum = g["dur"].transform(lambda s: s.cumsum().shift(1)).fillna(0.0)
+    cnt = dfb["src_flow_count"].replace(0, np.nan).astype("float32")
+    dfb["src_duration_mean"] = (dur_cum / cnt).fillna(0.0).astype("float32")
+
+    if dst_ip is not None:
+        dfb["_is_new_dstip"] = (~dfb.duplicated(subset=[src_ip, dst_ip])).astype("int8")
+        dfb["src_unique_dst_ip"] = (
+            dfb.groupby(src_ip, sort=False)["_is_new_dstip"]
+               .transform(lambda s: s.cumsum().shift(1))
+               .fillna(0).astype("int32")
+        )
+        dfb = dfb.drop(columns=["_is_new_dstip"])
+    else:
+        dfb["src_unique_dst_ip"] = 0
+
+    if dst_port is not None and dst_port in dfb.columns:
+        dfb["_is_new_dstport"] = (~dfb.duplicated(subset=[src_ip, dst_port])).astype("int8")
+        dfb["src_unique_dst_port"] = (
+            dfb.groupby(src_ip, sort=False)["_is_new_dstport"]
+               .transform(lambda s: s.cumsum().shift(1))
+               .fillna(0).astype("int32")
+        )
+        dfb = dfb.drop(columns=["_is_new_dstport"])
+    else:
+        dfb["src_unique_dst_port"] = 0
+
+    if dst_ip is not None:
+        dfb["dst_flow_count"] = dfb.groupby(dst_ip, sort=False).cumcount().astype("int32")
+
+        dfb["_is_new_srcip_for_dst"] = (~dfb.duplicated(subset=[dst_ip, src_ip])).astype("int8")
+        dfb["dst_unique_src_ip"] = (
+            dfb.groupby(dst_ip, sort=False)["_is_new_srcip_for_dst"]
+               .transform(lambda s: s.cumsum().shift(1))
+               .fillna(0).astype("int32")
+        )
+        dfb = dfb.drop(columns=["_is_new_srcip_for_dst"])
+
+        if src_port is not None and src_port in dfb.columns:
+            dfb["_is_new_srcport_for_dst"] = (~dfb.duplicated(subset=[dst_ip, src_port])).astype("int8")
+            dfb["dst_unique_src_port"] = (
+                dfb.groupby(dst_ip, sort=False)["_is_new_srcport_for_dst"]
+                   .transform(lambda s: s.cumsum().shift(1))
+                   .fillna(0).astype("int32")
+            )
+            dfb = dfb.drop(columns=["_is_new_srcport_for_dst"])
+        else:
+            dfb["dst_unique_src_port"] = 0
+    else:
+        dfb["dst_flow_count"] = 0
+        dfb["dst_unique_src_ip"] = 0
+        dfb["dst_unique_src_port"] = 0
+
+    bin_ms = TIME_BIN_MINUTES * 60 * 1000
+    if USE_TIMEBIN_BEHAVIOR and time_col is not None and pd.api.types.is_numeric_dtype(dfb[time_col]):
+        dfb["time_bin"] = (dfb[time_col] // bin_ms).astype("int64")
+
+        tb = dfb.groupby([src_ip, "time_bin"], sort=False).agg(
+            _cnt=("time_bin", "size"),
+            _udstip=(dst_ip, "nunique") if dst_ip is not None else ("time_bin", "size"),
+            _udstport=(dst_port, "nunique") if (dst_port is not None and dst_port in dfb.columns) else ("time_bin", "size"),
+        ).reset_index()
+
+        tb = tb.sort_values([src_ip, "time_bin"], kind="mergesort")
+        gb = tb.groupby(src_ip, sort=False)
+        tb["src_flow_count_5m"] = gb["_cnt"].shift(1).fillna(0).astype("int32")
+        tb["src_unique_dst_ip_5m"] = gb["_udstip"].shift(1).fillna(0).astype("int32")
+        tb["src_unique_dst_port_5m"] = gb["_udstport"].shift(1).fillna(0).astype("int32")
+
+        tb = tb[[src_ip, "time_bin", "src_flow_count_5m", "src_unique_dst_ip_5m", "src_unique_dst_port_5m"]]
+        dfb = dfb.merge(tb, on=[src_ip, "time_bin"], how="left")
+        for c in ["src_flow_count_5m", "src_unique_dst_ip_5m", "src_unique_dst_port_5m"]:
+            dfb[c] = dfb[c].fillna(0).astype("int32")
+    else:
+        dfb["time_bin"] = 0
+        dfb["src_flow_count_5m"] = 0
+        dfb["src_unique_dst_ip_5m"] = 0
+        dfb["src_unique_dst_port_5m"] = 0
+
+    dfb = dfb.drop(columns=["total_bytes", "total_pkts", "dur"], errors="ignore")
+    dfb = dfb.drop(columns=["_tmp_time_order_"], errors="ignore")
+
+    dfb = dfb.sort_values("_orig_order_", kind="mergesort").reset_index(drop=True)
+    dfb = dfb.drop(columns=["_orig_order_"], errors="ignore")
+    return dfb
+
+# =======================
+# Build feature sets
+# =======================
+schema_set = load_common_schema_list()
+
+numeric_all_full = df.select_dtypes(include=[np.number]).columns.tolist()
+if USE_COMMON_FEATURE_SCHEMA and schema_set:
+    numeric_all = [c for c in numeric_all_full if c in schema_set]
+    print(f"[SCHEMA] numeric_all restricted: {len(numeric_all_full)} -> {len(numeric_all)}")
+else:
+    numeric_all = numeric_all_full
+# =======================
+# Apply Anti-proxy: drop suspect features (nếu nằm trong numeric list)
+# =======================
+SUSPECT_COLS = [c for c in SUSPECT_COLS_CANDIDATES if c in df.columns]
+
+if DROP_SUSPECT_FEATURES:
+    before_n = len(numeric_all)
+    numeric_all = [c for c in numeric_all if c not in SUSPECT_COLS]
+    after_n = len(numeric_all)
+    print(f"[ANTI-PROXY] Dropped suspect cols (present in df): {SUSPECT_COLS}")
+    print(f"[ANTI-PROXY] numeric_all: {before_n} -> {after_n}")
+else:
+    print("[ANTI-PROXY] baseline mode: NOT dropping suspect features")
+
+LABEL_LIKE = [LABEL_COL, ATTACK_COL]
+
+TTL_COLS = [c for c in TTL_COLS_CAND if c in numeric_all] if DROP_TTL_ALWAYS else []
+PROXY_COLS = [c for c in PROXY_COLS_CAND if c in numeric_all] if DROP_PROXY_ALWAYS else []
+TIME_NUM_COLS = [c for c in TIME_COL_CANDIDATES if c in numeric_all] if DROP_RAW_TIME_FROM_MODEL else []
+
+if DROP_STUMP_PROXY_ALWAYS:
+    stump_cand = STUMP_PROXY_COLS_HARD if PROXY_DROP_MODE == "hard" else STUMP_PROXY_COLS_LIGHT
+    STUMP_PROXY_COLS = [c for c in stump_cand if c in numeric_all]
+else:
+    STUMP_PROXY_COLS = []
+
+print("\nDrop lists:")
+print(" TTL_COLS        =", TTL_COLS)
+print(" PROXY_COLS      =", PROXY_COLS)
+print(" TIME_COLS       =", TIME_NUM_COLS)
+print(" STUMP_PROXY_COLS=", STUMP_PROXY_COLS, f"(mode={PROXY_DROP_MODE}, enabled={DROP_STUMP_PROXY_ALWAYS})")
+
+drop_A = set(LABEL_LIKE) | set(TTL_COLS) | set(PROXY_COLS) | set(TIME_NUM_COLS) | set(STUMP_PROXY_COLS)
+features_A = [c for c in numeric_all if c not in drop_A]
+
+b_candidates = list(dict.fromkeys(numeric_all + ENGINEERED_BEHAVIOR_COLS))
+drop_B = set(LABEL_LIKE) | set(TTL_COLS) | set(PROXY_COLS) | set(TIME_NUM_COLS) | set(STUMP_PROXY_COLS)
+if DROP_TIME_BIN_AS_FEATURE:
+    drop_B.add("time_bin")
+features_B = [c for c in b_candidates if c not in drop_B]
+
+RAW_NET_NUM = [c for c in ["L4_SRC_PORT", "L4_DST_PORT", "PROTOCOL", "L7_PROTO",
+                           "TCP_FLAGS", "CLIENT_TCP_FLAGS", "SERVER_TCP_FLAGS"]
+               if c in features_B]
+if not KEEP_RAW_PORTS_PROTOCOL:
+    features_B = [c for c in features_B if c not in RAW_NET_NUM]
+    features_A = [c for c in features_A if c not in RAW_NET_NUM]
+
+if DROP_SRC_BEHAVIOR_IN_B:
+    features_B = [c for c in features_B if c not in SRC_PROXY_BEHAVIOR_COLS]
+    print("[B SAFE] Dropped src_* behavior cols:", sorted(SRC_PROXY_BEHAVIOR_COLS))
+if DROP_DST_BEHAVIOR_IN_B:
+    features_B = [c for c in features_B if c not in DST_PROXY_BEHAVIOR_COLS]
+    print("[B SAFE] Dropped dst_* behavior cols:", sorted(DST_PROXY_BEHAVIOR_COLS))
+
+print("\nFeature set sizes:")
+print("A_baseline_groupSplit =", len(features_A))
+print("B_behavior_groupSplit =", len(features_B))
+
+if len(features_A) == 0:
+    raise ValueError("features_A rỗng.")
+if len(features_B) == 0:
+    raise ValueError("features_B rỗng.")
+
+# =======================
+# DEDUP across splits
+# =======================
+if DEDUP_ACROSS_SPLITS:
+    if DEDUP_USE_BASE_NUMERIC:
+        dedup_cols = [c for c in numeric_all if c not in set(LABEL_LIKE) and c not in set(TIME_NUM_COLS)]
+    else:
+        dedup_cols = list(features_A)
+
+    test_idx = remove_cross_split_duplicates_by_hash(df, train_idx, test_idx, cols=dedup_cols)
+
+    print("After dedup: train_idx =", len(train_idx), "test_idx =", len(test_idx))
+    print("Index overlap (#):", int(len(np.intersect1d(train_idx, test_idx))))
+
+# =======================
+# Run pipeline (same split indices)
+# =======================
+def run_pipeline(
+    name: str,
+    df_source: pd.DataFrame,
+    feature_cols: list[str],
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    split_tag: str
+):
+    print("\n" + "=" * 80)
+    print(f"PIPELINE {name} | split={split_tag} | dataset_tag={DATASET_TAG}")
+    print("=" * 80)
+
+    df_train = df_source.iloc[train_idx].copy()
+    df_test = df_source.iloc[test_idx].copy()
+
+    y_train_bin = y_bin.iloc[train_idx].to_numpy()
+    y_test_bin = y_bin.iloc[test_idx].to_numpy()
+    y_train_attack = y_attack.iloc[train_idx].to_numpy()
+    y_test_attack = y_attack.iloc[test_idx].to_numpy()
+
+    if name.startswith("B_"):
+        df_train = add_behavior_features_online(df_train)
+        df_test = add_behavior_features_online(df_test)
+
+        missing = [c for c in ENGINEERED_BEHAVIOR_COLS if c not in df_train.columns]
+        if missing:
+            raise RuntimeError(f"[B] Missing engineered cols after add_behavior_features_online: {missing}")
+
+    X_train_view = clean_numeric_frame(df_train[feature_cols].copy())
+    sample = X_train_view.sample(min(len(X_train_view), DEBUG_SAMPLE_ROWS), random_state=RANDOM_STATE)
+    print("Sample NaN% (top 10):")
+    nan_pct = (sample.isna().mean() * 100).sort_values(ascending=False).head(10)
+    print(nan_pct.round(4))
+
+    X_train = clean_numeric_frame(df_train[feature_cols].copy())
+    X_test = clean_numeric_frame(df_test[feature_cols].copy())
+
+    print("Train:", X_train.shape, "Test:", X_test.shape)
+    print("Train label %:", (pd.Series(y_train_bin).value_counts(normalize=True) * 100).round(3).to_dict())
+    print("Test  label %:", (pd.Series(y_test_bin).value_counts(normalize=True) * 100).round(3).to_dict())
+
+    preprocessor = build_preprocessor(feature_cols)
+    X_train_proc = preprocessor.fit_transform(X_train)
+    X_test_proc = preprocessor.transform(X_test)
+
+    if SAVE_AS_FLOAT32:
+        X_train_proc = np.asarray(X_train_proc, dtype=np.float32)
+        X_test_proc = np.asarray(X_test_proc, dtype=np.float32)
+
+    preproc_path = ARTEFACT_DIR / f"preprocessor_{name}.joblib"
+    split_path = ARTEFACT_DIR / f"splits_{name}.npz"
+
+    joblib.dump(preprocessor, preproc_path)
+    np.savez_compressed(
+        split_path,
+        X_train=X_train_proc,
+        X_test=X_test_proc,
+        y_train=np.asarray(y_train_bin),
+        y_test=np.asarray(y_test_bin),
+        y_train_attack=np.asarray(y_train_attack),
+        y_test_attack=np.asarray(y_test_attack),
+        train_idx=np.asarray(train_idx),
+        test_idx=np.asarray(test_idx),
+        feature_names=np.asarray(feature_cols, dtype=object),
+    )
+
+    print("Saved:", preproc_path.resolve())
+    print("Saved:", split_path.resolve())
+
+    return {
+        "name": name,
+        "dataset_tag": DATASET_TAG,
+        "dataset_rel": str(DATASET_REL),
+        "split": split_tag,
+        "group_col": group_col,
+        "n_features": len(feature_cols),
+        "features": feature_cols,
+        "preprocessor_path": str(preproc_path),
+        "splits_path": str(split_path),
+        "drops": {
+            "ttl_cols": TTL_COLS,
+            "proxy_cols": PROXY_COLS,
+            "time_cols": TIME_NUM_COLS,
+            "stump_proxy_cols": STUMP_PROXY_COLS,
+            "stump_proxy_mode": PROXY_DROP_MODE,
+            "keep_raw_ports_protocol": KEEP_RAW_PORTS_PROTOCOL,
+            "b_safe_drop_src_behavior": bool(DROP_SRC_BEHAVIOR_IN_B),
+            "b_safe_drop_dst_behavior": bool(DROP_DST_BEHAVIOR_IN_B),
+            "dedup_across_splits": bool(DEDUP_ACROSS_SPLITS),
+            "dedup_use_base_numeric": bool(DEDUP_USE_BASE_NUMERIC),
+            "use_common_feature_schema": bool(USE_COMMON_FEATURE_SCHEMA and bool(schema_set)),
+        },
+    }
+
+meta = {}
+meta["A_baseline_groupSplit"] = run_pipeline(
+    name="A_baseline_groupSplit",
+    df_source=df,
+    feature_cols=features_A,
+    train_idx=train_idx,
+    test_idx=test_idx,
+    split_tag=split_tag,
+)
+meta["B_behavior_groupSplit"] = run_pipeline(
+    name="B_behavior_groupSplit",
+    df_source=df,
+    feature_cols=features_B,
+    train_idx=train_idx,
+    test_idx=test_idx,
+    split_tag=split_tag,
+)
+
+feat_json = ARTEFACT_DIR / "feature_lists.json"
+with open(feat_json, "w", encoding="utf-8") as f:
+    json.dump(meta, f, ensure_ascii=False, indent=2)
+print("\nSaved:", feat_json.resolve())
+
+classes_json = ARTEFACT_DIR / "attack_classes.json"
+with open(classes_json, "w", encoding="utf-8") as f:
+    json.dump({"classes": attack_classes}, f, ensure_ascii=False, indent=2)
+print("Saved:", classes_json.resolve())
+
+print("\nDONE Feature Engineering (2 pipelines, group split by SRC_IP).")
+print(f"Next: train using {ARTEFACT_DIR}/splits_*.npz")
