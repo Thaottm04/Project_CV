@@ -1,0 +1,628 @@
+# Convert PCAP files to CSV for display on a dashboard.
+# Create a dashboard to display on the screen.
+
+import os
+import time
+import glob
+import nfstream
+import pandas as pd
+import numpy as np
+
+# Required for Windows environments utilizing Npcap
+os.add_dll_directory(r"C:\Windows\System32") 
+
+def extract_features_nfstream(pcap_path, output_csv):
+    print(f"[INFO] Analyzing file {pcap_path} using NFStream...")
+    if not os.path.exists(pcap_path):
+        print(f"[ERROR] File not found: {pcap_path}")
+        return
+
+    # 1. Initialize NFStreamer
+    streamer = nfstream.NFStreamer(source=pcap_path)
+    df = streamer.to_pandas()
+
+    if df.empty:
+        print("[WARNING] No valid network flows found in the file.")
+        return
+
+    # 2. Base Features Mapping
+    rename_map = {
+        'src_ip': 'IPV4_SRC_ADDR',
+        'dst_ip': 'IPV4_DST_ADDR',
+        'src_port': 'L4_SRC_PORT',
+        'dst_port': 'L4_DST_PORT',
+        'protocol': 'PROTOCOL',
+        'application_name': 'L7_PROTO',
+        'src2dst_bytes': 'IN_BYTES',
+        'src2dst_packets': 'IN_PKTS',
+        'dst2src_bytes': 'OUT_BYTES',
+        'dst2src_packets': 'OUT_PKTS',
+        'bidirectional_duration_ms': 'FLOW_DURATION_MILLISECONDS',
+        'src2dst_duration_ms': 'DURATION_IN',
+        'dst2src_duration_ms': 'DURATION_OUT',
+        'bidirectional_first_seen_ms': 'FLOW_START_MILLISECONDS',
+        'bidirectional_last_seen_ms': 'FLOW_END_MILLISECONDS'
+    }
+    df_mapped = df.rename(columns=rename_map)
+
+    print("[INFO] Calculating behavioral features...")
+
+    # 3. Feature Engineering
+    # Protocols & Ports
+    if 'PROTOCOL' in df_mapped.columns:
+        df_mapped['is_tcp'] = (df_mapped['PROTOCOL'] == 6).astype(int)
+        df_mapped['is_udp'] = (df_mapped['PROTOCOL'] == 17).astype(int)
+        df_mapped['is_icmp'] = (df_mapped['PROTOCOL'] == 1).astype(int)
+        df_mapped['is_other_l4'] = (~df_mapped['PROTOCOL'].isin([1, 6, 17])).astype(int)
+
+    if 'L4_DST_PORT' in df_mapped.columns:
+        df_mapped['dst_port_privileged'] = (df_mapped['L4_DST_PORT'] <= 1024).astype(int)
+        df_mapped['dst_port_ephemeral'] = (df_mapped['L4_DST_PORT'] >= 49152).astype(int)
+        
+        # Basic port bucketing
+        df_mapped['dst_port_bucket'] = (df_mapped['L4_DST_PORT'] // 10000).astype(int)
+
+        # Service Classification
+        df_mapped['svc_http'] = (df_mapped['L4_DST_PORT'].isin([80, 8080])).astype(int)
+        df_mapped['svc_https'] = (df_mapped['L4_DST_PORT'] == 443).astype(int)
+        df_mapped['svc_dns'] = (df_mapped['L4_DST_PORT'] == 53).astype(int)
+        df_mapped['svc_ftp'] = (df_mapped['L4_DST_PORT'].isin([20, 21])).astype(int)
+        df_mapped['svc_ssh'] = (df_mapped['L4_DST_PORT'] == 22).astype(int)
+        df_mapped['svc_smtp'] = (df_mapped['L4_DST_PORT'].isin([25, 465, 587])).astype(int)
+
+    # Volume and Logarithmic Time Features
+    df_mapped['bytes_per_pkt'] = np.where(df_mapped['IN_PKTS'] > 0, df_mapped['IN_BYTES'] / df_mapped['IN_PKTS'], 0)
+    df_mapped['log_total_bytes'] = np.log1p(df_mapped['IN_BYTES'] + df_mapped.get('OUT_BYTES', 0))
+    df_mapped['log_flow_duration_s'] = np.log1p(df_mapped['FLOW_DURATION_MILLISECONDS'] / 1000.0)
+  
+    # Calculate Throughput (Bytes per second)
+    duration_sec = df_mapped['FLOW_DURATION_MILLISECONDS'] / 1000.0
+    duration_sec = duration_sec.replace(0, 0.001) # Prevent division by zero
+    df_mapped['log_throughput_bps'] = np.log1p((df_mapped['IN_BYTES'] * 8) / duration_sec)
+
+    # --- IP-BASED STATISTICAL FEATURES (DOS & SCAN DETECTION) ---
+    # Group by Source IP
+    src_stats = df_mapped.groupby('IPV4_SRC_ADDR').agg(
+        src_flow_count=('IPV4_SRC_ADDR', 'count'),
+        src_unique_dst_ip=('IPV4_DST_ADDR', 'nunique'),
+        src_unique_dst_port=('L4_DST_PORT', 'nunique'),
+        src_bytes_sum=('IN_BYTES', 'sum'),
+        src_pkts_sum=('IN_PKTS', 'sum'),
+        src_duration_mean=('FLOW_DURATION_MILLISECONDS', 'mean')
+    ).reset_index()
+
+    # Group by Destination IP
+    dst_stats = df_mapped.groupby('IPV4_DST_ADDR').agg(
+        dst_flow_count=('IPV4_DST_ADDR', 'count'),
+        dst_unique_src_ip=('IPV4_SRC_ADDR', 'nunique'),
+        dst_unique_src_port=('L4_SRC_PORT', 'nunique')
+    ).reset_index()
+
+    # Merge statistical columns into the main dataframe
+    df_mapped = df_mapped.merge(src_stats, on='IPV4_SRC_ADDR', how='left')
+    df_mapped = df_mapped.merge(dst_stats, on='IPV4_DST_ADDR', how='left')
+
+    # 5-minute window features - Simplified for short PCAP analysis
+    # Directly assigning total metrics as demo pcaps are typically brief
+    df_mapped['src_flow_count_5m'] = df_mapped['src_flow_count']
+    df_mapped['src_unique_dst_ip_5m'] = df_mapped['src_unique_dst_ip']
+    df_mapped['src_unique_dst_port_5m'] = df_mapped['src_unique_dst_port']
+
+    # Save results
+    df_mapped.to_csv(output_csv, index=False)
+    print(f"[SUCCESS] Extracted and processed {len(df_mapped)} network flows. Results saved to: {output_csv}")
+
+def get_latest_pcap_file(directory, pattern="*.pcapng"):
+    """Finds the most recently created PCAPNG file in the specified directory."""
+    list_of_files = glob.glob(os.path.join(directory, pattern))
+    if not list_of_files:
+        return None
+    latest_file = max(list_of_files, key=os.path.getctime)
+    return latest_file
+
+if __name__ == "__main__":
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    
+    # Define the directory containing PCAP files
+    WATCH_DIR = os.path.join(BASE_DIR, "attack_demo")
+    csv_out_path = os.path.join(BASE_DIR, "live_traffic.csv")
+    
+    # Create directory if it does not exist
+    os.makedirs(WATCH_DIR, exist_ok=True)
+    
+    print(f"[INFO] Monitoring directory for PCAP/PCAPNG files: {WATCH_DIR}")
+    print("[INFO] Press Ctrl+C to stop the program.\n")
+    
+    last_processed_file = ""
+    last_modified_time = 0
+
+    try:
+        while True:
+            # Locate all .pcap or .pcapng files in the directory
+            list_of_files = glob.glob(os.path.join(WATCH_DIR, "*.pcap*"))
+            
+            if list_of_files:
+                # Identify the most recently modified file
+                latest_file = max(list_of_files, key=os.path.getmtime)
+                current_modified_time = os.path.getmtime(latest_file)
+                
+                # Trigger if a new file appears OR an existing file is updated
+                if latest_file != last_processed_file or current_modified_time != last_modified_time:
+                    
+                    # CRITICAL: Wait 10 seconds to allow packet sniffers (like Wireshark) to finish writing to disk
+                    time.sleep(10) 
+                    
+                    print("\n" + "="*50)
+                    print(f"[EVENT] New or updated file detected: {os.path.basename(latest_file)}")
+                    print("[INFO] Starting extraction process...")
+                    
+                    try:
+                        extract_features_nfstream(latest_file, csv_out_path)
+                        # Update state to prevent reprocessing unless the file is modified again
+                        last_processed_file = latest_file
+                        last_modified_time = current_modified_time
+                    except Exception as e:
+                        print(f"[ERROR] Extraction failed: {e}")
+            
+            # Pause before scanning the directory again
+            time.sleep(3)
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Directory monitoring terminated by user.")
+
+
+==========================================================================================================================================================
+==========================================================================================================================================================
+==========================================================================================================================================================
+==========================================================================================================================================================
+==========================================================================================================================================================
+
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import joblib
+import sqlite3
+import os
+import plotly.express as px
+import time
+
+# ==========================================
+# 1. PATH & DATABASE CONFIGURATION
+# ==========================================
+BASE_DIR = r"D:\Information Security\Final\NIDS_demo"
+DB_PATH = os.path.join(BASE_DIR, "nids_db.sqlite")
+# Tên file CSV mà tool pcap_to_csv sinh ra liên tục
+LIVE_CSV_FILENAME = "live_traffic.csv" 
+LIVE_CSV_PATH = os.path.join(BASE_DIR, LIVE_CSV_FILENAME)
+
+# Initialize Database (Table 'alert')
+def init_db():
+    db = sqlite3.connect(DB_PATH)
+    cursor = db.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alert (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            src_ip TEXT,
+            dst_ip TEXT,
+            src_port INTEGER,
+            dst_port INTEGER,
+            protocol TEXT,
+            if_anomaly_score REAL,
+            rf_attack_prob REAL,
+            xgb_attack_prob REAL,
+            alert_level TEXT
+        )
+    """)
+    db.commit()
+    db.close()
+
+init_db()
+
+# ==========================================
+# 2. LOAD MODELS & DATA STRUCTURE
+# ==========================================
+st.set_page_config(page_title="NIDS Real-time Dashboard", layout="wide", page_icon="🛡️")
+
+@st.cache_resource
+def load_models_and_features():
+    models = {}
+    try:
+        models['RF'] = joblib.load(os.path.join(BASE_DIR, "rf_model_v3_B_behavior_groupSplit.pkl"))
+        models['XGB'] = joblib.load(os.path.join(BASE_DIR, "xgb_model_v3_B_behavior_groupSplit.pkl"))
+        models['IF'] = joblib.load(os.path.join(BASE_DIR, "if_model_v3_B_behavior_groupSplit.pkl"))
+        
+        # [QUAN TRỌNG] BẮT BUỘC PHẢI LOAD PREPROCESSOR
+        models['PREPROCESSOR'] = joblib.load(os.path.join(BASE_DIR, "preprocessor_B_behavior_groupSplit.joblib"))
+        
+    except Exception as e:
+        st.error(f"Error loading models or preprocessor: {e}. Please check .pkl and .joblib files")
+        return None, None
+
+    # Khai báo CHÍNH XÁC 68 Features của Model B
+    expected_features = [
+      "L4_SRC_PORT", "L4_DST_PORT", "PROTOCOL", "L7_PROTO", "IN_BYTES", "IN_PKTS",
+      "OUT_BYTES", "OUT_PKTS", "FLOW_DURATION_MILLISECONDS", "DURATION_IN", "DURATION_OUT",
+      "SRC_TO_DST_SECOND_BYTES", "DST_TO_SRC_SECOND_BYTES", "RETRANSMITTED_IN_BYTES",
+      "RETRANSMITTED_IN_PKTS", "RETRANSMITTED_OUT_BYTES", "RETRANSMITTED_OUT_PKTS",
+      "SRC_TO_DST_AVG_THROUGHPUT", "NUM_PKTS_UP_TO_128_BYTES", "NUM_PKTS_128_TO_256_BYTES",
+      "NUM_PKTS_256_TO_512_BYTES", "NUM_PKTS_512_TO_1024_BYTES", "NUM_PKTS_1024_TO_1514_BYTES",
+      "TCP_WIN_MAX_IN", "TCP_WIN_MAX_OUT", "ICMP_TYPE", "ICMP_IPV4_TYPE", "DNS_QUERY_ID",
+      "DNS_QUERY_TYPE", "DNS_TTL_ANSWER", "FTP_COMMAND_RET_CODE", "SRC_TO_DST_IAT_MIN",
+      "SRC_TO_DST_IAT_MAX", "SRC_TO_DST_IAT_AVG", "SRC_TO_DST_IAT_STDDEV", "DST_TO_SRC_IAT_MIN",
+      "DST_TO_SRC_IAT_MAX", "DST_TO_SRC_IAT_AVG", "DST_TO_SRC_IAT_STDDEV", "is_tcp",
+      "is_udp", "is_icmp", "is_other_l4", "dst_port_privileged", "dst_port_ephemeral",
+      "dst_port_bucket", "svc_http", "svc_https", "svc_dns", "svc_ftp", "svc_ssh",
+      "svc_smtp", "bytes_per_pkt", "log_total_bytes", "log_flow_duration_s", "log_throughput_bps",
+      "src_flow_count", "src_unique_dst_ip", "src_unique_dst_port", "src_bytes_sum",
+      "src_pkts_sum", "src_duration_mean", "dst_flow_count", "dst_unique_src_ip",
+      "dst_unique_src_port", "src_flow_count_5m", "src_unique_dst_ip_5m", "src_unique_dst_port_5m"
+    ]
+        
+    return models, expected_features
+
+models, expected_features = load_models_and_features()
+
+# ==========================================
+# 3. UI & MAIN PROCESSING
+# ==========================================
+st.sidebar.title("⚙️ NIDS Settings")
+st.sidebar.markdown("---")
+
+st.sidebar.subheader("Filters")
+top_k = st.sidebar.number_input("Top-K Attacks (RF/XGB)", min_value=1, max_value=100000, value=500, step=50)
+if_threshold = st.sidebar.slider("IF Anomaly Threshold", -1.0, 1.0, 0.0, step=0.05)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Data Source")
+
+# --- LUỒNG XỬ LÝ LẤY FILE TỰ ĐỘNG GỌN GÀNG ---
+auto_refresh = st.sidebar.checkbox(f"Auto-read '{LIVE_CSV_FILENAME}'", value=False)
+
+# Mặc định quét lại sau xx giây nếu bật Auto (Nhập thủ công)
+#refresh_rate = 10
+
+# Thêm thanh trượt chỉ hiện ra khi ô Auto-read được tick
+if auto_refresh:
+    refresh_rate = st.sidebar.slider("⏱️ Refresh rate (seconds)", min_value=1, max_value=60, value=5, step=1)
+else:
+    refresh_rate = 5 # Giá trị dự phòng ẩn
+
+df = None
+file_identifier = None
+
+if auto_refresh:
+    # Nếu bật tự động: Bỏ qua upload, tự tìm file trong thư mục
+    st.sidebar.success("Live mode active. Auto-fetching latest traffic...")
+    if os.path.exists(LIVE_CSV_PATH):
+        try:
+            df = pd.read_csv(LIVE_CSV_PATH)
+            file_identifier = LIVE_CSV_FILENAME
+        except Exception as e:
+            st.sidebar.error(f"Error reading {LIVE_CSV_FILENAME}: {e}")
+    else:
+        st.sidebar.warning(f"Waiting for {LIVE_CSV_FILENAME} to be generated...")
+else:
+    # Nếu tắt tự động: Cho phép Upload file tĩnh
+    uploaded_file = st.sidebar.file_uploader("Upload CSV File manually", type=['csv'])
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+        file_identifier = uploaded_file.name
+
+# --- XỬ LÝ DỮ LIỆU NẾU DF TỒN TẠI ---
+if df is not None and models is not None:
+    with st.spinner("Analyzing network traffic using AI... Please wait."):
+        # Lấy nhãn thực tế nếu có
+        if 'Label' in df.columns:
+            df['y_true'] = df['Label']
+        elif 'Attack' in df.columns:
+            df['y_true'] = df['Attack']
+        else:
+            df['y_true'] = 'Unknown'
+        
+        # Preprocessing
+        df_features = df.copy()
+        cols_to_drop_live = ['Label', 'Attack', 'IPV4_SRC_ADDR', 'IPV4_DST_ADDR', 'Dataset', 'y_true']
+        cols_to_drop_live = [c for c in cols_to_drop_live if c in df_features.columns]
+        df_features = df_features.drop(columns=cols_to_drop_live)
+        
+        df_features = df_features.replace([np.inf, -np.inf], np.nan).fillna(0)
+        for col in df_features.select_dtypes(include=['object']).columns:
+            df_features[col] = pd.factorize(df_features[col])[0]
+            
+        # --- CHUẨN BỊ 2 MA TRẬN DỮ LIỆU ĐỘC LẬP ---
+        # 1. Padding cho RF/XGB (68 cột)
+        df_padded = pd.DataFrame(0, index=np.arange(len(df_features)), columns=expected_features)
+        for col in df_features.columns:
+            if col in df_padded.columns:
+                df_padded[col] = df_features[col]
+                
+        # 2. Padding cho IF (51 cột)
+        X_ready = models['PREPROCESSOR'].transform(df_padded)
+        
+        # --- CHẠY 3 MODEL VỚI X_ready ĐÃ ĐƯỢC TIỀN XỬ LÝ ---
+        df['if_score'] = models['IF'].decision_function(X_ready) 
+        df['rf_prob'] = models['RF'].predict_proba(X_ready)[:, 1] 
+        df['xgb_prob'] = models['XGB'].predict_proba(X_ready)[:, 1] 
+        df['max_attack_prob'] = df[['rf_prob', 'xgb_prob']].max(axis=1)
+
+        # THÊM CỘT TỈ LỆ PHẦN TRĂM NGHI NGỜ
+        df['Suspicion (%)'] = (df['max_attack_prob'] * 100).round(2).astype(str) + '%'
+
+        # --- ALERT CLASSIFICATION (Leader's Logic) ---
+        df['alert_level'] = 'Green (Benign)'
+
+        # 1. Isolation Forest (Anomalies)
+        df.loc[df['if_score'] < if_threshold, 'alert_level'] = 'Yellow (Anomaly)'
+
+        # 2. RF/XGB Top-K Attacks
+        top_k_indices = df.nlargest(top_k, 'max_attack_prob').index
+        df.loc[top_k_indices, 'alert_level'] = 'Red (Attack)'
+
+        # SPLIT DATAFRAMES
+        df_red = df[df['alert_level'] == 'Red (Attack)']
+        df_yellow = df[df['alert_level'] == 'Yellow (Anomaly)']
+        df_green = df[df['alert_level'] == 'Green (Benign)']
+
+        # Determine Dynamic Threshold for the Red Vertical Line
+        dynamic_top_k_threshold = df_red['max_attack_prob'].min() if not df_red.empty else 1.0
+
+        # ==========================================
+        # EXPORT & SAVE TO DATABASE (ALERTS ONLY)
+        # ==========================================
+        df_to_save = df[df['alert_level'] != 'Green (Benign)'].copy()
+        csv_export_data = None 
+
+        if not df_to_save.empty:
+            alert_data = pd.DataFrame({
+                'src_ip': df_to_save.get('IPV4_SRC_ADDR', 'Unknown').astype(str),
+                'dst_ip': df_to_save.get('IPV4_DST_ADDR', 'Unknown').astype(str),
+                'src_port': df_to_save.get('L4_SRC_PORT', 0).astype(int),
+                'dst_port': df_to_save.get('L4_DST_PORT', 0).astype(int),
+                'protocol': df_to_save.get('PROTOCOL', 'N/A').astype(str),
+                'if_anomaly_score': df_to_save['if_score'].astype(float),
+                'rf_attack_prob': df_to_save['rf_prob'].astype(float),
+                'xgb_attack_prob': df_to_save['xgb_prob'].astype(float),
+                'alert_level': df_to_save['alert_level'].astype(str)
+            })
+
+            alert_data.insert(0, 'timestamp', pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"))
+            csv_export_data = alert_data.to_csv(index=False).encode('utf-8')
+
+            if 'last_processed_time' not in st.session_state:
+                st.session_state.last_processed_time = 0
+
+            # Logic chống lưu trùng vào CSDL
+            current_mod_time = os.path.getmtime(LIVE_CSV_PATH) if auto_refresh and os.path.exists(LIVE_CSV_PATH) else None
+
+            should_save = False
+            if not auto_refresh and st.session_state.get('processed_file') != file_identifier:
+                should_save = True
+                st.session_state.processed_file = file_identifier
+            elif auto_refresh and current_mod_time != st.session_state.last_processed_time:
+                should_save = True
+                st.session_state.last_processed_time = current_mod_time
+
+            if should_save:
+                with sqlite3.connect(DB_PATH) as db:
+                    alert_data.to_sql('alert', db, if_exists='append', index=False)
+                
+                EXPORT_DIR = os.path.join(BASE_DIR, "exported_alerts")
+                os.makedirs(EXPORT_DIR, exist_ok=True)
+                current_time = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+                export_filename = f"attack_logs_{current_time}.csv"
+                export_filepath = os.path.join(EXPORT_DIR, export_filename)
+                
+                alert_data.to_csv(export_filepath, index=False)
+                st.toast(f"Saved {len(alert_data)} new alerts to Database.", icon="💾")
+
+        # ==========================================
+        # 4. DASHBOARD VISUALIZATION
+        # ==========================================
+        st.title("Network Security Dashboard (NIDS)")
+        
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Flows Scanned", f"{len(df):,}")
+        c2.metric("🟢 Benign", f"{len(df_green):,}")
+        c3.metric("🟡 Anomaly (IF)", f"{len(df_yellow):,}")
+        c4.metric("🔴 Attack (Top-K)", f"{len(df_red):,}")
+
+        st.markdown("---")
+        
+        # --- TRAFFIC TIMELINE ---
+        st.subheader("📈 Traffic Timeline (Event Sequence)")
+        timeline_df = df[['alert_level']].copy()
+        if 'FIRST_SWITCHED' in df.columns:
+            timeline_df['Time'] = df['FIRST_SWITCHED']
+        else:
+            chunk_size = max(1, len(df) // 50)
+            timeline_df['Time'] = (np.arange(len(df)) // chunk_size) * chunk_size
+            
+        timeline_grouped = timeline_df.groupby(['Time', 'alert_level']).size().reset_index(name='Count')
+        fig_timeline = px.area(timeline_grouped, x='Time', y='Count', color='alert_level',
+                               color_discrete_map={'Green (Benign)': '#00CC96', 'Yellow (Anomaly)': '#F39C12', 'Red (Attack)': '#EF553B'})
+        fig_timeline.update_layout(xaxis_title="Time / Flow Sequence", yaxis_title="Number of Flows", margin=dict(l=0, r=0, t=30, b=0))
+        st.plotly_chart(fig_timeline, use_container_width=True)
+
+        st.markdown("---")
+
+        col_chart1, col_chart2 = st.columns(2)
+        with col_chart1:
+            st.subheader("Status Distribution")
+            pie_data = df['alert_level'].value_counts().reset_index()
+            pie_data.columns = ['Status', 'Count']
+            fig_pie = px.pie(pie_data, values='Count', names='Status', color='Status',
+                            color_discrete_map={'Green (Benign)': '#00CC96', 'Yellow (Anomaly)': '#F39C12', 'Red (Attack)': '#EF553B'},
+                            hole=0.4)
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+        with col_chart2:
+            st.subheader("Targeted Protocols (Alerts)")
+            if not df_to_save.empty and 'PROTOCOL' in df_to_save.columns:
+                proto_data = df_to_save['PROTOCOL'].value_counts().reset_index()
+                proto_data.columns = ['Protocol', 'Flows']
+                fig_bar = px.bar(proto_data, x='Protocol', y='Flows', color='Protocol')
+                st.plotly_chart(fig_bar, use_container_width=True)
+            else:
+                st.info("No alert data.")
+
+        # ==========================================
+        # EXPLAINABLE AI (XAI)
+        # ==========================================
+        st.markdown("---")
+        st.subheader("Model Explainability (XAI): Feature Importance")
+        st.caption("*Note: Missing features from live PCAP (e.g., historical TCP windows) are securely padded. Models rely heavily on behavioral and time-based extracted features for live inference.*")
+        
+        if hasattr(models['RF'], 'feature_importances_'):
+            importances = models['RF'].feature_importances_
+            
+            if hasattr(models['PREPROCESSOR'], 'get_feature_names_out'):
+                final_cols = models['PREPROCESSOR'].get_feature_names_out()
+            else:
+                final_cols = [f"Feature_{i}" for i in range(len(importances))]
+            
+            feature_df = pd.DataFrame({'Feature': final_cols, 'Importance': importances})
+            feature_df = feature_df.sort_values(by='Importance', ascending=False).head(10)
+            
+            fig_xai = px.bar(feature_df, x='Importance', y='Feature', orientation='h', 
+                             color='Importance', color_continuous_scale='Blues')
+            fig_xai.update_layout(yaxis={'categoryorder': 'total ascending'}, margin=dict(l=0, r=0, t=0, b=0))
+            st.plotly_chart(fig_xai, use_container_width=True)
+
+        # ==========================================
+        # STATISTICAL DISTRIBUTIONS
+        # ==========================================
+        st.markdown("---")
+        st.subheader("Statistical Distributions")
+        
+        col_dist1, col_dist2 = st.columns(2)
+        
+        with col_dist1:
+            st.markdown("**AI Model Confidence (RF vs XGB)**")
+            hist_data = df[['rf_prob', 'xgb_prob']].melt(var_name='Model', value_name='Probability')
+            hist_data['Model'] = hist_data['Model'].map({'rf_prob': 'Random Forest', 'xgb_prob': 'XGBoost'})
+
+            fig_prob_hist = px.histogram(hist_data, x='Probability', color='Model', barmode='overlay',
+                                    nbins=50, opacity=0.7,
+                                    color_discrete_map={'Random Forest': '#3498DB', 'XGBoost': '#E74C3C'})
+            
+            fig_prob_hist.add_vline(x=dynamic_top_k_threshold, line_dash="dash", line_color="white", line_width=2,
+                            annotation_text=f"Top-K Cutoff ({dynamic_top_k_threshold:.2f})", 
+                            annotation_position="top right", annotation_font_color="white")
+
+            fig_prob_hist.update_layout(xaxis_title="Attack Probability", yaxis_title="Number of Flows", margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig_prob_hist, use_container_width=True)
+
+        with col_dist2:
+            st.markdown("**Isolation Forest Anomaly Scores**")
+            fig_if_hist = px.histogram(df, x='if_score', color='alert_level', barmode='overlay',
+                                    nbins=50, opacity=0.75,
+                                    color_discrete_map={'Green (Benign)': '#00CC96', 
+                                                        'Yellow (Anomaly)': '#F39C12', 
+                                                        'Red (Attack)': '#EF553B'},
+                                    labels={'if_score': 'Anomaly Score', 'alert_level': 'Predicted Alert'})
+            
+            fig_if_hist.add_vline(x=if_threshold, line_dash="dash", line_color="white", line_width=2,
+                            annotation_text=f"IF Threshold ({if_threshold})", 
+                            annotation_position="top left", annotation_font_color="white")
+
+            fig_if_hist.update_layout(xaxis_title="IF Anomaly Score", yaxis_title="Number of Flows", margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig_if_hist, use_container_width=True)
+
+        # ==========================================
+        # THREAT INTELLIGENCE
+        # ==========================================
+        st.markdown("---")
+        st.subheader("Threat Intelligence: Top Attackers & Targets")
+            
+        col_ip1, col_ip2 = st.columns(2)
+            
+        with col_ip1:
+            if not df_to_save.empty and 'IPV4_SRC_ADDR' in df_to_save.columns:
+                top_src = df_to_save['IPV4_SRC_ADDR'].value_counts().head(10).reset_index()
+                top_src.columns = ['Source IP', 'Alert Count']
+                fig_src = px.bar(top_src, x='Alert Count', y='Source IP', orientation='h',
+                                title="Top 10 Source IPs", text='Alert Count',
+                                color='Alert Count', color_continuous_scale='Reds')
+                fig_src.update_layout(yaxis={'categoryorder': 'total ascending'})
+                st.plotly_chart(fig_src, use_container_width=True)
+            else:
+                st.info("No attacker data detected.")
+
+        with col_ip2:
+            if not df_to_save.empty and 'IPV4_DST_ADDR' in df_to_save.columns:
+                top_dst = df_to_save['IPV4_DST_ADDR'].value_counts().head(10).reset_index()
+                top_dst.columns = ['Destination IP', 'Alert Count']
+                fig_dst = px.bar(top_dst, x='Alert Count', y='Destination IP', orientation='h',
+                                title="Top 10 Destination IPs", text='Alert Count',
+                                color='Alert Count', color_continuous_scale='Oranges')
+                fig_dst.update_layout(yaxis={'categoryorder': 'total ascending'})
+                st.plotly_chart(fig_dst, use_container_width=True)
+            else:
+                st.info("No victim data detected.")
+
+        # ==========================================
+        # TOP-K LOGS ANALYSIS & EVALUATION
+        # ==========================================
+        st.markdown("---")
+        
+        col_log_title, col_download = st.columns([3, 1])
+        with col_log_title:
+            st.subheader("Detailed Logs Analysis & Model Evaluation")
+        with col_download:
+            if csv_export_data is not None:
+                st.download_button(
+                    label="Download Alert Logs (CSV)",
+                    data=csv_export_data,
+                    file_name="nids_alert_report.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+        base_cols = ['IPV4_SRC_ADDR', 'IPV4_DST_ADDR', 'L4_DST_PORT', 'PROTOCOL']
+        if 'y_true' in df.columns and df['y_true'].nunique() > 1:
+            base_cols.append('y_true')
+            
+        extra_cols = [c for c in ['IN_BYTES', 'IN_PKTS', 'TCP_FLAGS', 'FLOW_DURATION'] if c in df.columns]
+        display_cols = base_cols + extra_cols
+        
+        tab_red, tab_yellow, tab_green = st.tabs([f"🔴 Attacks", "🟡 Anomalies", "🟢 Benign"])
+        
+        # --- HÀM FORMAT CHỐNG LỖI HIỂN THỊ 4E... ---
+        def format_for_display(df_target, cols):
+            df_disp = df_target[cols].copy()
+            for c in df_disp.columns:
+                if pd.api.types.is_float_dtype(df_disp[c]):
+                    df_disp[c] = df_disp[c].apply(lambda x: f"{x:.4f}" if pd.notnull(x) else x)
+                elif pd.api.types.is_integer_dtype(df_disp[c]):
+                    df_disp[c] = df_disp[c].apply(lambda x: f"{x:,}" if pd.notnull(x) else x)
+            return df_disp
+
+        with tab_red:
+            st.markdown(f"**Sorted by highest attack probability (RF/XGB).**")
+            top_k_red = df_red.sort_values(by='max_attack_prob', ascending=False)
+            cols_to_show_red = display_cols + ['Suspicion (%)', 'rf_prob', 'xgb_prob', 'if_score']
+            st.dataframe(format_for_display(top_k_red, cols_to_show_red), use_container_width=True)
+            
+        with tab_yellow:
+            st.markdown("**Flows flagged by Isolation Forest (Zero-day / Unseen behaviors).** Sorted by most anomalous.")
+            top_k_yellow = df_yellow.sort_values(by='if_score', ascending=True)
+            cols_to_show_yellow = display_cols + ['if_score', 'Suspicion (%)', 'rf_prob', 'xgb_prob']
+            st.dataframe(format_for_display(top_k_yellow, cols_to_show_yellow), use_container_width=True)
+            
+        with tab_green:
+            st.markdown("**Safe network traffic.** Normal operations.")
+            st.dataframe(format_for_display(df_green, display_cols), use_container_width=True)
+
+else:
+    st.info("Please upload a CSV file or enable Auto-read from the sidebar to start analysis.")
+
+# Dòng quan trọng: Lệnh Rerun đặt Ở ĐÂY, ngoài cùng mọi khối if/else
+if auto_refresh:
+    time.sleep(refresh_rate)
+    st.rerun()
+
+
+
+
