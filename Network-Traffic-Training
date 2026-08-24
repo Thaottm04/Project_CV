@@ -1,0 +1,780 @@
+# Take two files of the same type but different versions from Kaggle, then train them using three machine learning models.
+
+# train_models_v2v3.py
+# PyCharm-friendly (NO CLI args)
+# - Train models (RF / XGB / IF) on v2+v3, pipelines A+B
+# - Export scores CSV (dataset_tag, pipeline, model, y_true, score, seed)
+# - Report metrics at fixed thresholds, Top-K, threshold@K
+# - Feature importance & Ablation
+
+from __future__ import annotations
+
+import joblib
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    accuracy_score,
+    balanced_accuracy_score,
+    roc_curve,
+)
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.inspection import permutation_importance
+import matplotlib
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+
+# =============================================================================
+# USER CONFIG
+# =============================================================================
+FAST_DEV_RUN = False   # True = chạy nhanh smoke test | False = chạy full để báo cáo
+
+DATASET_TAGS = ["v3", "v2"] 
+PIPELINES = ["B_behavior_groupSplit"] 
+SEED = 42
+
+RUN_TAG = "baseline"      
+REPORT_SUBDIR = "review3"
+
+# Operating points (final)
+ALERTS_PER_1M_LIST = [1000, 5000, 50000, 100000]
+THRESHOLD_LIST = [0.5]
+ALSO_REPORT_THRESHOLD_AT_K = True
+
+IF_THRESHOLD_AS_QUANTILE = True
+IF_THRESHOLD_QUANTILES = [0.90, 0.95, 0.99]   
+
+# Models (Đã bật lại toàn bộ theo chuẩn)
+RUN_RF = True
+RUN_XGB = True
+RUN_IF = True
+
+# Speed / RAM controls
+SUP_TRAIN_MAX = None
+SUP_EVAL_MAX  = None
+IF_BENIGN_FIT_MAX = 200_000
+
+# Model hyperparams
+RF_N_ESTIMATORS = 200
+IF_N_ESTIMATORS = 200
+
+# Figures
+PLOT_FIGURES = True
+PLOT_TOPK_ONLY_ALERTS = [1000, 50000, 100000]  
+
+# Importance
+DO_IMPORTANCE = True
+IMPORTANCE_TOPN = 20
+DO_PERM_IMPORTANCE = False
+PERM_IMPORTANCE_N = 50_000
+
+# Ablation (RF)
+DO_ABLATION = False
+ABLATION_TOPN_DROP = [10, 20]
+ABLATION_TRAIN_MAX = 50_000
+ABLATION_EVAL_MAX  = 50_000
+
+# ---------
+# FAST mode overrides (smoke test)
+# ---------
+if FAST_DEV_RUN:
+    DATASET_TAGS = ["v3"] 
+    SUP_TRAIN_MAX = 200_000
+    SUP_EVAL_MAX  = 200_000
+    ALERTS_PER_1M_LIST = []
+    ALSO_REPORT_THRESHOLD_AT_K = False
+    DO_ABLATION = False
+
+# =============================================================================
+# Validations
+# =============================================================================
+assert RUN_TAG in ["baseline", "anti_proxy"], "RUN_TAG chỉ được là 'baseline' hoặc 'anti_proxy'"
+
+if not FAST_DEV_RUN:
+    assert SUP_EVAL_MAX is None, "Final run: SUP_EVAL_MAX phải None để Top-K chuẩn"
+
+ARTEFACTS_DIRNAME = "artefacts"
+
+# =============================================================================
+# Root finder & Paths (Đường dẫn của bạn)
+# =============================================================================
+ROOT = Path(r"D:\Information Security\Final")
+
+# =============================================================================
+# IO helpers
+# =============================================================================
+def load_npz(art_dir: Path, pipeline: str):
+    """
+    Dùng lại logic đọc NPZ chuẩn của Leader để giữ nguyên GroupSplit
+    """
+    npz_path = art_dir / f"splits_{pipeline}.npz"
+    if not npz_path.exists():
+        raise FileNotFoundError(f"Missing NPZ: {npz_path}")
+
+    z = np.load(npz_path, allow_pickle=True)
+    X_train = z["X_train"]
+    X_test = z["X_test"]
+    y_train = z["y_train"].astype(int)
+    y_test = z["y_test"].astype(int)
+
+    feature_names = None
+    if "feature_names" in z.files:
+        feature_names = [str(x) for x in list(z["feature_names"])]
+
+    return X_train, X_test, y_train, y_test, feature_names
+
+
+def stratified_sample_idx(y: np.ndarray, max_n: Optional[int], seed: int) -> np.ndarray:
+    n = int(len(y))
+    if max_n is None or max_n <= 0 or max_n >= n:
+        return np.arange(n, dtype=np.int64)
+
+    rng = np.random.default_rng(seed)
+    y = y.astype(int)
+
+    pos_idx = np.where(y == 1)[0]
+    neg_idx = np.where(y == 0)[0]
+
+    pos_rate = float(np.mean(y == 1))
+    n_pos = int(round(max_n * pos_rate))
+    n_pos = max(1, min(n_pos, len(pos_idx)))
+    n_neg = max_n - n_pos
+    n_neg = max(1, min(n_neg, len(neg_idx)))
+
+    take_pos = rng.choice(pos_idx, size=n_pos, replace=False) if len(pos_idx) else np.array([], dtype=np.int64)
+    take_neg = rng.choice(neg_idx, size=n_neg, replace=False) if len(neg_idx) else np.array([], dtype=np.int64)
+
+    idx = np.concatenate([take_pos, take_neg])
+    rng.shuffle(idx)
+    return idx.astype(np.int64)
+
+
+def k_from_alerts_per_1m(n_total: int, alerts_per_1m: int) -> int:
+    k = int(round((alerts_per_1m / 1_000_000) * n_total))
+    return max(k, 1)
+
+
+def predict_topk(score: np.ndarray, alerts_per_1m: int) -> Tuple[np.ndarray, int]:
+    n = int(len(score))
+    k = k_from_alerts_per_1m(n, alerts_per_1m)
+    order = np.argsort(score)[::-1]
+    yhat = np.zeros(n, dtype=int)
+    yhat[order[:k]] = 1
+    return yhat, k
+
+
+def threshold_at_k(score: np.ndarray, k: int) -> float:
+    n = len(score)
+    k = max(1, min(int(k), int(n)))
+    order = np.argsort(score)[::-1]
+    thr = score[order[k - 1]]
+    return float(thr)
+
+def bin_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_score: Optional[np.ndarray]) -> Dict[str, Any]:
+    acc = accuracy_score(y_true, y_pred)
+    bal = balanced_accuracy_score(y_true, y_pred)
+
+    p_pos, r_pos, f1_pos, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", pos_label=1, zero_division=0
+    )
+    p_m, r_m, f1_m, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
+    )
+
+    out = {
+        "n_eval": int(len(y_true)),
+        "pos_rate_eval": float(np.mean(y_true == 1)),
+        "accuracy": float(acc),
+        "balanced_accuracy": float(bal),
+        "precision_pos": float(p_pos),
+        "recall_pos": float(r_pos),
+        "f1_pos": float(f1_pos),
+        "precision_macro": float(p_m),
+        "recall_macro": float(r_m),
+        "f1_macro": float(f1_m),
+        "pred_pos": int(y_pred.sum()),
+    }
+
+    if y_score is not None:
+        try:
+            out["roc_auc"] = float(roc_auc_score(y_true, y_score))
+        except Exception:
+            out["roc_auc"] = None
+        try:
+            out["pr_auc"] = float(average_precision_score(y_true, y_score))
+        except Exception:
+            out["pr_auc"] = None
+    else:
+        out["roc_auc"] = None
+        out["pr_auc"] = None
+    return out
+
+
+def conf_to_dict(y_true, y_pred):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+
+
+def plot_confmat(y_true, y_pred, title, out_path: Path, normalize=True):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    cm_plot = cm.astype(float)
+
+    if normalize:
+        rs = cm_plot.sum(axis=1, keepdims=True)
+        cm_plot = cm_plot / np.maximum(rs, 1.0)
+
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(111)
+    im = ax.imshow(cm_plot, aspect="auto")
+    ax.set_title(title + ("\n(norm by true rows)" if normalize else ""))
+    ax.set_xlabel("Pred")
+    ax.set_ylabel("True")
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(["0", "1"])
+    ax.set_yticklabels(["0", "1"])
+
+    for i in range(cm_plot.shape[0]):
+        for j in range(cm_plot.shape[1]):
+            if normalize:
+                txt = f"{cm_plot[i, j]:.4f}\n({cm[i, j]})"
+            else:
+                txt = f"{int(cm[i, j])}"
+            ax.text(
+                j, i, txt,
+                ha="center", va="center",
+                color="white" if cm_plot[i, j] < 0.5 else "black",
+                fontsize=11, fontweight="bold"
+            )
+
+    fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+def plot_roc(y_true, y_score, title, out_path: Path):
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(111)
+    ax.plot(fpr, tpr)
+    ax.set_title(title)
+    ax.set_xlabel("FPR")
+    ax.set_ylabel("TPR")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def drop_features_by_name(Xtr, Xte, feature_names: List[str], drop_set: set[str]):
+    keep_idx = [i for i, f in enumerate(feature_names) if f not in drop_set]
+    Xtr2 = Xtr[:, keep_idx]
+    Xte2 = Xte[:, keep_idx]
+    fn2 = [feature_names[i] for i in keep_idx]
+    return Xtr2, Xte2, fn2
+
+
+def feature_groups(feature_names: List[str]) -> Dict[str, set[str]]:
+    fset = set(feature_names)
+
+    def pick(pred):
+        return {f for f in fset if pred(f)}
+
+    groups = {
+        "ports_proto": pick(lambda f: f in {"L4_SRC_PORT", "L4_DST_PORT", "PROTOCOL", "L7_PROTO"}
+                                     or f.startswith("DNS_") or f.startswith("FTP_") or f.startswith("ICMP_")),
+        "bytes_pkts": pick(lambda f: "BYTES" in f or "PKTS" in f or "THROUGHPUT" in f or "RETRANSMITTED" in f),
+        "timing_iat": pick(lambda f: "IAT" in f or "DURATION" in f or "FLOW_DURATION" in f),
+        "tcp_flags_win": pick(lambda f: "TCP_" in f or "FLAGS" in f or "WIN" in f),
+        "behavior_semantic": pick(lambda f: f.startswith("src_") or f.startswith("dst_") or f.startswith("svc_")
+                                           or f.startswith("is_") or f.startswith("log_")
+                                           or f in {"bytes_per_pkt", "dst_port_bucket", "dst_port_privileged",
+                                                    "dst_port_ephemeral", "time_bin"}),
+    }
+    return {k: v for k, v in groups.items() if len(v) > 0}
+
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def fmt_thr_tag(thr: float) -> str:
+    s = f"{thr:.6g}"
+    return s.replace(".", "p")
+
+
+# =============================================================================
+# Model builders
+# =============================================================================
+def train_rf(Xtr, ytr):
+    rf = RandomForestClassifier(
+        n_estimators=120,
+        max_depth=18,
+        min_samples_leaf=5,
+        max_features="sqrt",
+        n_jobs=2,
+        random_state=int(SEED),
+        class_weight="balanced_subsample",
+    )
+    rf.fit(Xtr, ytr)
+    return rf
+
+def try_make_xgb(scale_pos_weight: float, base_score: float):
+    try:
+        from xgboost import XGBClassifier
+        return XGBClassifier(
+            objective="binary:logistic",
+            n_estimators=160,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=4.0,
+            reg_alpha=1.5,
+            min_child_weight=20,
+            gamma=1.0,
+            random_state=int(SEED),
+            n_jobs=2,
+            tree_method="hist",
+            eval_metric="auc",
+            scale_pos_weight=1.0,
+            base_score=float(base_score),
+            max_delta_step=1,
+        )
+    except Exception as e:
+        print("[WARN] XGB unavailable:", repr(e))
+        return None
+
+def train_if_benign_only(Xtr, ytr):
+    benign_idx = np.where(ytr == 0)[0]
+    rng = np.random.default_rng(SEED + 10)
+    if IF_BENIGN_FIT_MAX is not None and 0 < IF_BENIGN_FIT_MAX < len(benign_idx):
+        benign_idx = rng.choice(benign_idx, size=int(IF_BENIGN_FIT_MAX), replace=False)
+
+    contamination = float(np.mean(ytr == 1))
+    contamination = min(max(contamination, 0.001), 0.4)
+
+    iso = IsolationForest(
+        n_estimators=int(IF_N_ESTIMATORS),
+        contamination=float(contamination),
+        random_state=int(SEED),
+        n_jobs=-1,
+        max_samples="auto",
+    )
+    iso.fit(Xtr[benign_idx])
+    return iso
+
+
+# =============================================================================
+# Main run per dataset/pipeline
+# =============================================================================
+def run_one(dataset_tag: str, pipeline: str):
+    art_dir = ensure_dir(ROOT / ARTEFACTS_DIRNAME / dataset_tag / RUN_TAG)
+    report_dir = ROOT / "reports" / REPORT_SUBDIR / RUN_TAG / dataset_tag / pipeline
+    fig_dir = ensure_dir(report_dir / "figures")
+    table_dir = ensure_dir(report_dir / "tables")
+    scores_dir = ensure_dir(report_dir / "scores")
+
+    # Load dữ liệu từ file NPZ đã được chia sẵn chuẩn xác
+    X_train, X_test, y_train, y_test, feature_names = load_npz(art_dir, pipeline)
+    
+    if feature_names is None:
+        feature_names = [f"f{i}" for i in range(X_train.shape[1])]
+
+    # subsample for training/eval (optional)
+    tr_idx = stratified_sample_idx(y_train, SUP_TRAIN_MAX, SEED + 1)
+    te_idx = stratified_sample_idx(y_test, SUP_EVAL_MAX, SEED + 2)
+    Xtr, ytr = X_train[tr_idx], y_train[tr_idx]
+    Xte, yte = X_test[te_idx], y_test[te_idx]
+
+    print(f"\n=== {dataset_tag} | {pipeline} | RUN_TAG={RUN_TAG} | FAST_DEV_RUN={FAST_DEV_RUN} ===")
+    print("Xtr", Xtr.shape, "Xte", Xte.shape,
+          "pos_tr", float(np.mean(ytr == 1)), "pos_te", float(np.mean(yte == 1)))
+
+    dfs_scores = []
+    rows_metrics: List[Dict[str, Any]] = []
+
+    def add_score_rows(model_short: str, score: np.ndarray):
+        df_temp = pd.DataFrame({
+            "dataset_tag": dataset_tag,
+            "pipeline": pipeline,
+            "model": model_short,
+            "y_true": yte.astype(int),
+            "score": score.astype(float),
+            "seed": int(SEED),
+        })
+        dfs_scores.append(df_temp)
+
+    def maybe_plot_conf(ytrue, ypred, title, base_name: str):
+        if not PLOT_FIGURES:
+            return
+        plot_confmat(ytrue, ypred, title, fig_dir / f"{base_name}_norm.png", normalize=True)
+        plot_confmat(ytrue, ypred, title, fig_dir / f"{base_name}_counts.png", normalize=False)
+
+    def eval_all_operating_points(model_name: str, model_short: str, score: np.ndarray):
+        if model_short == "IF" and IF_THRESHOLD_AS_QUANTILE:
+            thr_specs = [("q", float(q)) for q in IF_THRESHOLD_QUANTILES]
+        else:
+            thr_specs = [("score", float(t)) for t in THRESHOLD_LIST]
+
+        for thr_type, thr_val in thr_specs:
+            if thr_type == "q":
+                thr = float(np.quantile(score, thr_val))
+                thr_tag = f"q{int(round(thr_val * 1000))}"
+                title = f"{model_short} ConfMat @q={thr_val} (thr={thr:.6g})"
+                base = f"confmat_{model_short}_q{thr_tag}"
+            else:
+                thr = float(thr_val)
+                thr_tag = fmt_thr_tag(thr)
+                title = f"{model_short} ConfMat @thr={thr}"
+                base = f"confmat_{model_short}_thr{thr_tag}"
+
+            pred = (score >= thr).astype(int)
+            m = bin_metrics(yte, pred, score)
+            m.update({
+                "dataset_tag": dataset_tag,
+                "pipeline": pipeline,
+                "model": model_name,
+                "model_short": model_short,
+                "mode": "threshold",
+                "threshold": float(thr),
+                "threshold_type": thr_type,      
+                "threshold_param": float(thr_val),
+                "alerts_per_1m": None,
+                "k": None,
+                **conf_to_dict(yte, pred),
+            })
+            rows_metrics.append(m)
+            maybe_plot_conf(yte, pred, title, base)
+
+        for alerts in ALERTS_PER_1M_LIST:
+            alerts = int(alerts)
+            do_plot = (PLOT_TOPK_ONLY_ALERTS is None) or (alerts in set(PLOT_TOPK_ONLY_ALERTS))
+
+            pred, k = predict_topk(score, alerts)
+            m = bin_metrics(yte, pred, score)
+
+            tp = int(((yte == 1) & (pred == 1)).sum())
+            pos = int((yte == 1).sum())
+            m["precision_at_k"] = float(tp / max(k, 1))
+            m["recall_at_k"] = float(tp / max(pos, 1))
+
+            m.update({
+                "dataset_tag": dataset_tag,
+                "pipeline": pipeline,
+                "model": model_name,
+                "model_short": model_short,
+                "mode": "topk",
+                "threshold": None,
+                "threshold_type": None,
+                "threshold_param": None,
+                "alerts_per_1m": int(alerts),
+                "k": int(k),
+                **conf_to_dict(yte, pred),
+            })
+            rows_metrics.append(m)
+
+            if PLOT_FIGURES and do_plot:
+                maybe_plot_conf(
+                    yte, pred,
+                    f"{model_short} ConfMat TopK alerts/1M={alerts} (K={k})",
+                    f"confmat_{model_short}_topk{alerts}"
+                )
+
+            if ALSO_REPORT_THRESHOLD_AT_K:
+                thrk = threshold_at_k(score, k)
+                predk = (score >= thrk).astype(int)
+                mk = bin_metrics(yte, predk, score)
+                mk.update({
+                    "dataset_tag": dataset_tag,
+                    "pipeline": pipeline,
+                    "model": model_name,
+                    "model_short": model_short,
+                    "mode": "threshold_at_k",
+                    "threshold": float(thrk),
+                    "threshold_type": "score",
+                    "threshold_param": None,
+                    "alerts_per_1m": int(alerts),
+                    "k": int(k),
+                    **conf_to_dict(yte, predk),
+                })
+                rows_metrics.append(mk)
+
+        if PLOT_FIGURES:
+            plot_roc(yte, score, f"ROC {model_short}", fig_dir / f"roc_{model_short}.png")
+
+    # -------------------------
+    # Train + score each model
+    # -------------------------
+    if RUN_RF:
+        rf = train_rf(Xtr, ytr)
+        model_out_path = art_dir / f"rf_model_{dataset_tag}_{pipeline}.pkl"
+        joblib.dump(rf, model_out_path)
+        score = rf.predict_proba(Xte)[:, 1]
+        add_score_rows("RF", score)
+        eval_all_operating_points("RandomForest(binary)", "RF", score)
+
+        if DO_IMPORTANCE:
+            imp = pd.DataFrame({
+                "feature": feature_names,
+                "importance": rf.feature_importances_.astype(float),
+            }).sort_values("importance", ascending=False)
+
+            imp.to_csv(table_dir / f"importance_{dataset_tag}_{pipeline}_RF_gini_all.csv",
+                       index=False, encoding="utf-8-sig")
+            imp.head(IMPORTANCE_TOPN).to_csv(
+                table_dir / f"importance_{dataset_tag}_{pipeline}_RF_top{IMPORTANCE_TOPN}.csv",
+                index=False, encoding="utf-8-sig"
+            )
+
+            if DO_PERM_IMPORTANCE:
+                te_idx2 = stratified_sample_idx(yte, PERM_IMPORTANCE_N, SEED + 99)
+                r = permutation_importance(
+                    rf,
+                    Xte[te_idx2],
+                    yte[te_idx2],
+                    n_repeats=5,
+                    random_state=SEED,
+                    n_jobs=-1
+                )
+                pimp = pd.DataFrame({
+                    "feature": feature_names,
+                    "perm_importance_mean": r.importances_mean.astype(float),
+                    "perm_importance_std": r.importances_std.astype(float),
+                }).sort_values("perm_importance_mean", ascending=False)
+
+                pimp.to_csv(table_dir / f"perm_importance_{dataset_tag}_{pipeline}_RF.csv",
+                            index=False, encoding="utf-8-sig")
+
+    if RUN_XGB:
+        base_score = float(np.mean(ytr == 1))
+        xgb = try_make_xgb(1.0, base_score)
+
+        if xgb is not None:
+            xgb.fit(Xtr, ytr, verbose=False)
+            model_out_path = art_dir / f"xgb_model_{dataset_tag}_{pipeline}.pkl"
+            joblib.dump(xgb, model_out_path)
+            score = xgb.predict_proba(Xte)[:, 1]
+            print("XGB score quantiles:", np.quantile(score, [0, 0.01, 0.05, 0.1, 0.5, 0.9, 0.99, 1.0]))
+
+            add_score_rows("XGB", score)
+            eval_all_operating_points("XGBoost(binary)", "XGB", score)
+
+    if RUN_IF:
+        iso = train_if_benign_only(Xtr, ytr)
+        
+        model_out_path = art_dir / f"if_model_{dataset_tag}_{pipeline}.pkl"
+        joblib.dump(iso, model_out_path)
+        
+        score = -iso.decision_function(Xte)  
+        add_score_rows("IF", score)
+        eval_all_operating_points("IsolationForest(unsupervised)", "IF", score)
+
+    # -------------------------
+    # Save scores + metrics
+    # -------------------------
+    if dfs_scores:
+        df_scores = pd.concat(dfs_scores, ignore_index=True)
+    else:
+        df_scores = pd.DataFrame()
+        
+    df_metrics = pd.DataFrame(rows_metrics)
+
+    out_scores = scores_dir / f"scores_{dataset_tag}_{pipeline}.csv"
+    out_metrics = table_dir / f"metrics_{dataset_tag}_{pipeline}.csv"
+
+    df_scores.to_csv(out_scores, index=False, encoding="utf-8-sig")
+    df_metrics.to_csv(out_metrics, index=False, encoding="utf-8-sig")
+
+    print("[Saved]", out_scores)
+    print("[Saved]", out_metrics)
+
+    # -------------------------
+    # Ablation (RF) on subsample
+    # -------------------------
+    if DO_ABLATION and DO_IMPORTANCE and RUN_RF:
+        print("[Ablation] RF (subsampled) ...")
+
+        ab_tr_idx = stratified_sample_idx(ytr, ABLATION_TRAIN_MAX, SEED + 501)
+        ab_te_idx = stratified_sample_idx(yte, ABLATION_EVAL_MAX, SEED + 502)
+
+        Xtr_ab, ytr_ab = Xtr[ab_tr_idx], ytr[ab_tr_idx]
+        Xte_ab, yte_ab = Xte[ab_te_idx], yte[ab_te_idx]
+
+        rf_full = train_rf(Xtr_ab, ytr_ab)
+        score_full = rf_full.predict_proba(Xte_ab)[:, 1]
+        full_auc = float(roc_auc_score(yte_ab, score_full))
+
+        groups = feature_groups(feature_names)
+        imp_series = pd.Series(rf_full.feature_importances_.astype(float), index=feature_names).sort_values(ascending=False)
+
+        ab_rows: List[Dict[str, Any]] = [{
+            "ablation": "full",
+            "n_drop": 0,
+            "roc_auc": full_auc,
+            "n_train": int(len(ytr_ab)),
+            "n_eval": int(len(yte_ab)),
+        }]
+
+        for gname, gset in groups.items():
+            Xtr2, Xte2, _ = drop_features_by_name(Xtr_ab, Xte_ab, feature_names, gset)
+            rf2 = train_rf(Xtr2, ytr_ab)
+            sc2 = rf2.predict_proba(Xte2)[:, 1]
+            ab_rows.append({
+                "ablation": f"drop_group:{gname}",
+                "n_drop": int(len(gset)),
+                "roc_auc": float(roc_auc_score(yte_ab, sc2)),
+                "n_train": int(len(ytr_ab)),
+                "n_eval": int(len(yte_ab)),
+            })
+
+        for n in ABLATION_TOPN_DROP:
+            n = int(n)
+            drop_set = set(imp_series.head(n).index.tolist())
+            Xtr2, Xte2, _ = drop_features_by_name(Xtr_ab, Xte_ab, feature_names, drop_set)
+            rf2 = train_rf(Xtr2, ytr_ab)
+            sc2 = rf2.predict_proba(Xte2)[:, 1]
+            ab_rows.append({
+                "ablation": f"drop_top{n}_features",
+                "n_drop": int(n),
+                "roc_auc": float(roc_auc_score(yte_ab, sc2)),
+                "n_train": int(len(ytr_ab)),
+                "n_eval": int(len(yte_ab)),
+            })
+
+        out_ab = table_dir / f"ablation_{dataset_tag}_{pipeline}_RF.csv"
+        pd.DataFrame(ab_rows).to_csv(out_ab, index=False, encoding="utf-8-sig")
+        print("[Saved]", out_ab)
+
+
+def main():
+    for tag in DATASET_TAGS:
+        for pipe in PIPELINES: 
+            run_one(tag, pipe)
+
+    print("\nDONE train_models_v2v3.py")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================================================================
+================================================================================================================================
+================================================================================================================================
+================================================================================================================================
+================================================================================================================================
+================================================================================================================================
+
+
+# train_models_final.py
+from __future__ import annotations
+
+from pathlib import Path
+import re
+
+def replace_block(src: str, pattern: str, replacement: str, label: str) -> str:
+    # Dùng re.S (dotall) để dấu chấm (.) bao gồm cả ký tự xuống dòng \n
+    new_src, n = re.subn(pattern, replacement, src, flags=re.S)
+    if n != 1:
+        raise RuntimeError(f'Không thay được block {label}; số match={n}')
+    return new_src
+
+def main() -> None:
+    dashboard_dir = Path(r"D:\Information Security\Final\dashboard")
+    src_path = dashboard_dir / 'train_models_v2v3.py'
+    
+    if not src_path.exists():
+        raise FileNotFoundError(f'Không thấy file gốc: {src_path}')
+
+    print(f"[*] Đang đọc và chỉnh sửa linh động file: {src_path} ...")
+    src = src_path.read_text(encoding='utf-8')
+
+    # 1) RUN_TAG + report dir final (Dùng regex để tự động dò tìm dù có bị thay đổi chuỗi string gốc)
+    src = re.sub(r'RUN_TAG\s*=\s*"baseline".*', 'RUN_TAG = "final"', src)
+    src = re.sub(r'REPORT_SUBDIR\s*=\s*"review3".*', 'REPORT_SUBDIR = "final"', src)
+    
+    # Bypass kiểm tra chuỗi RUN_TAG ban đầu
+    src = src.replace(
+        'assert RUN_TAG in ["baseline", "anti_proxy"], "RUN_TAG chỉ được là \'baseline\' hoặc \'anti_proxy\'"',
+        'assert RUN_TAG in ["baseline", "anti_proxy", "final"], "RUN_TAG chỉ được là \'baseline\' hoặc \'anti_proxy\' hoặc \'final\'"'
+    )
+
+    # 2) Final RF = RF_O_d4_l500_s33
+    rf_replacement = '''def train_rf(Xtr, ytr):
+    rf = RandomForestClassifier(
+        n_estimators=30,
+        max_depth=4,
+        min_samples_leaf=500,
+        min_samples_split=320,
+        max_features="sqrt",
+        max_samples=0.33,
+        bootstrap=True,
+        n_jobs=2,
+        random_state=int(SEED),
+        class_weight="balanced_subsample",
+    )
+    rf.fit(Xtr, ytr)
+    return rf
+'''
+    # Regex lookahead: Tìm từ 'def train_rf' đến ngay trước 'def try_make_xgb'
+    src = replace_block(src, r'def train_rf\(Xtr, ytr\):.*?(?=def try_make_xgb)', rf_replacement + '\n', 'train_rf')
+
+    # 3) Final XGB = config đã chốt
+    xgb_replacement = '''def try_make_xgb(scale_pos_weight: float, base_score: float):
+    try:
+        from xgboost import XGBClassifier
+        return XGBClassifier(
+            objective="binary:logistic",
+            n_estimators=100,
+            max_depth=2,
+            learning_rate=0.05,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_lambda=5.0,
+            reg_alpha=2.0,
+            min_child_weight=40,
+            gamma=2.0,
+            random_state=int(SEED),
+            n_jobs=2,
+            tree_method="hist",
+            eval_metric="auc",
+            scale_pos_weight=1.0,
+            base_score=float(base_score),
+            max_delta_step=1,
+        )
+    except Exception as e:
+        print("[WARN] XGB unavailable:", repr(e))
+        return None
+'''
+    # Regex lookahead: Tìm từ 'def try_make_xgb' đến ngay trước 'def train_if_benign_only'
+    src = replace_block(src, r'def try_make_xgb\(scale_pos_weight: float, base_score: float\):.*?(?=def train_if_benign_only)', xgb_replacement + '\n', 'try_make_xgb')
+
+    print("[*] Đã gắn tham số mô hình Final! Bắt đầu quá trình huấn luyện...")
+    
+    # Compile mã lệnh động từ chuỗi đã chỉnh sửa
+    code = compile(src, str(src_path), 'exec')
+    glb = {
+        '__name__': '__main__',
+        '__file__': str(src_path),
+        '__package__': None,
+        '__cached__': None,
+    }
+    
+    # Thực thi mã
+    exec(code, glb)
+
+
+if __name__ == '__main__':
+    main()
